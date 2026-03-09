@@ -7,34 +7,35 @@ bag_to_vdb.py
 ROS 2 bag -> registered point cloud -> OpenVDB level-set map.
 
 Pipeline:
-  1) Read PointCloud2 + optional odometry/IMU from a ROS 2 bag
-  2) Pairwise Point-to-Plane ICP registration + pose graph
-  3) Optional loop closure detection (FPFH + RANSAC + ICP)
-  4) Global pose graph optimisation
-  5) Merge all registered clouds into a single world-frame cloud
-  6) Optional floor leveling (RANSAC plane fit + rotation)
-  7) Voxel downsample -> Radius outlier removal -> SOR -> DBSCAN
-  8) Save debug point cloud as .ply
-  9) Build OpenVDB narrow-band level-set map and save as .vdb
+1) Read PointCloud2 + optional odometry from a ROS 2 bag
+2) Pairwise Point-to-Plane ICP registration + pose graph
+3) Optional loop closure detection (FPFH + RANSAC + ICP)
+4) Global pose graph optimisation
+5) Merge all registered clouds into a single world-frame cloud
+6) Optional floor leveling (RANSAC plane fit + rotation)
+7) Voxel downsample -> Radius outlier removal -> SOR -> DBSCAN
+8) Save debug point cloud as .ply
+9) Build OpenVDB narrow-band level-set map and save as .vdb
 
 VDB level-set output:
-  Occupied voxels are seeded from the cleaned, registered point cloud.
-  topologyToLevelSet converts binary topology into a proper narrow-band
-  signed-distance level set.
-  A kd-tree-based fallback is used automatically when topologyToLevelSet
-  is not exposed by the installed pyopenvdb bindings.
+Occupied voxels are seeded from the cleaned, registered point cloud.
+topologyToLevelSet converts binary topology into a proper narrow-band
+signed-distance level set.
+A kd-tree-based fallback is used automatically when topologyToLevelSet
+is not exposed by the installed pyopenvdb bindings.
 
 Transform bug fix (vs. naive C++ reference):
-  The reference example creates a local Transform(scale=1.0) for
-  worldToIndexCellCentered(), which does NOT match the grid's own
-  Transform(scale=vdb_voxel_size). All index positions are therefore
-  computed at 1.0 m/voxel regardless of the configured resolution.
-  Here the mapping is done directly via NumPy:
-      ijk = floor(world / vdb_voxel_size + 0.5)
-  so the index coordinates always match the grid's transform exactly.
+The reference example creates a local Transform(scale=1.0) for
+worldToIndexCellCentered(), which does NOT match the grid's own
+Transform(scale=vdb_voxel_size). All index positions are therefore
+computed at 1.0 m/voxel regardless of the configured resolution.
+Here the mapping is done directly via NumPy:
+ijk = floor(world / vdb_voxel_size + 0.5)
+so the index coordinates always match the grid's transform exactly.
 """
 
 import argparse
+import bisect
 import copy
 import sys
 from pathlib import Path
@@ -60,7 +61,6 @@ _POINTFIELD_TO_DTYPE = {
     8: np.float64,
 }
 
-
 def convert_ros_pc2_to_o3d(msg):
     """
     Convert ROS 2 sensor_msgs/PointCloud2 to Open3D PointCloud (XYZ only).
@@ -78,8 +78,8 @@ def convert_ros_pc2_to_o3d(msg):
         z_off, z_dt = fields["z"]
 
         if (x_dt not in _POINTFIELD_TO_DTYPE or
-                y_dt not in _POINTFIELD_TO_DTYPE or
-                z_dt not in _POINTFIELD_TO_DTYPE):
+            y_dt not in _POINTFIELD_TO_DTYPE or
+            z_dt not in _POINTFIELD_TO_DTYPE):
             return None
 
         if not (x_dt == y_dt == z_dt):
@@ -96,9 +96,9 @@ def convert_ros_pc2_to_o3d(msg):
             return None
 
         dtype = np.dtype({
-            "names":    ["x", "y", "z"],
-            "formats":  [np_dt, np_dt, np_dt],
-            "offsets":  [x_off, y_off, z_off],
+            "names": ["x", "y", "z"],
+            "formats": [np_dt, np_dt, np_dt],
+            "offsets": [x_off, y_off, z_off],
             "itemsize": itemsize,
         })
 
@@ -120,7 +120,6 @@ def convert_ros_pc2_to_o3d(msg):
     except Exception:
         return None
 
-
 # ---------------------------------------------------------------------------
 # Odometry -> 4x4 transform
 # ---------------------------------------------------------------------------
@@ -128,31 +127,33 @@ def convert_ros_pc2_to_o3d(msg):
 def get_odom_transform(odom_msg):
     """Extract 4x4 transform from nav_msgs/Odometry pose."""
     try:
-        pos  = odom_msg.pose.pose.position
+        pos = odom_msg.pose.pose.position
         quat = odom_msg.pose.pose.orientation
-        t    = np.array([pos.x, pos.y, pos.z], dtype=np.float64)
-        rot  = R.from_quat([quat.x, quat.y, quat.z, quat.w]).as_matrix()
+        t = np.array([pos.x, pos.y, pos.z], dtype=np.float64)
+        rot = R.from_quat([quat.x, quat.y, quat.z, quat.w]).as_matrix()
         T = np.eye(4, dtype=np.float64)
         T[:3, :3] = rot
-        T[:3, 3]  = t
+        T[:3, 3] = t
         return T
     except Exception:
         return None
 
-
-def get_closest_timestamp(ts, ts_to_value):
-    """Find closest timestamp key in a dict to ts."""
-    if not ts_to_value:
+def get_closest_timestamp(ts, sorted_keys):
+    """Find closest timestamp key in a sorted list to ts."""
+    if not sorted_keys:
         return None
-    return min(ts_to_value.keys(), key=lambda k: abs(k - ts))
-
+    idx = bisect.bisect_left(sorted_keys, ts)
+    if idx == 0: return sorted_keys[0]
+    if idx == len(sorted_keys): return sorted_keys[-1]
+    before, after = sorted_keys[idx - 1], sorted_keys[idx]
+    return before if (ts - before) <= (after - ts) else after
 
 # ---------------------------------------------------------------------------
 # Registration helpers (FPFH + RANSAC + ICP) for loop closure
 # ---------------------------------------------------------------------------
 
 def compute_fpfh_descriptor(pcd, voxel_size):
-    radius_normal  = voxel_size * 2.0
+    radius_normal = voxel_size * 2.0
     radius_feature = voxel_size * 5.0
 
     if not pcd.has_normals():
@@ -168,7 +169,6 @@ def compute_fpfh_descriptor(pcd, voxel_size):
     )
     return fpfh
 
-
 def ransac_coarse_alignment(source, target, source_fpfh, target_fpfh,
                             voxel_size, ransac_thresh_mult=5.0):
     distance_threshold = voxel_size * float(ransac_thresh_mult)
@@ -176,7 +176,7 @@ def ransac_coarse_alignment(source, target, source_fpfh, target_fpfh,
         source, target, source_fpfh, target_fpfh,
         mutual_filter=False,
         max_correspondence_distance=distance_threshold,
-        estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+        estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(),
         ransac_n=4,
         checkers=[
             o3d.pipelines.registration.CorrespondenceCheckerBasedOnEdgeLength(0.9),
@@ -187,7 +187,6 @@ def ransac_coarse_alignment(source, target, source_fpfh, target_fpfh,
     if result.fitness > 0.1:
         return result.transformation
     return None
-
 
 def detect_loop_closure(
     current_idx,
@@ -215,10 +214,11 @@ def detect_loop_closure(
     if not search_indices:
         return []
 
-    current_pos    = historical_poses[current_idx][:3, 3]
+    current_pos = historical_poses[current_idx][:3, 3]
     hist_positions = np.array(
         [historical_poses[i][:3, 3] for i in search_indices], dtype=np.float64
     )
+
     if hist_positions.shape[0] == 0:
         return []
 
@@ -237,8 +237,10 @@ def detect_loop_closure(
         if cand_fpfh is None:
             continue
 
+        cand_pcd = copy.deepcopy(historical_pcds[cand_idx])
+
         coarse = ransac_coarse_alignment(
-            current_pcd, historical_pcds[cand_idx],
+            current_pcd, cand_pcd,
             current_fpfh, cand_fpfh, voxel_size
         )
         if coarse is None:
@@ -246,7 +248,7 @@ def detect_loop_closure(
 
         icp = o3d.pipelines.registration.registration_icp(
             current_pcd,
-            historical_pcds[cand_idx],
+            cand_pcd,
             voxel_size * 2.0,
             coarse,
             o3d.pipelines.registration.TransformationEstimationPointToPlane(),
@@ -257,7 +259,6 @@ def detect_loop_closure(
             loop_closures.append((cand_idx, icp.transformation, icp.fitness))
 
     return loop_closures
-
 
 # ---------------------------------------------------------------------------
 # VDB level-set construction
@@ -271,7 +272,7 @@ def _build_kdtree_sdf(pts, ijk_unique, voxel_size, half_width):
     Euclidean distance from each candidate voxel centre to the nearest
     point cloud point, and stores values within the narrow band.
 
-    The result is an unsigned SDF (all values >= 0).  Voxels at the
+    The result is an unsigned SDF (all values >= 0). Voxels at the
     surface have a value near 0; voxels further away have larger values
     up to half_width * voxel_size (the truncation distance).
     This is sufficient for collision-checking and path-planning in most
@@ -300,19 +301,19 @@ def _build_kdtree_sdf(pts, ijk_unique, voxel_size, half_width):
         for row in cands.reshape(-1, 3):
             voxel_set.add((int(row[0]), int(row[1]), int(row[2])))
 
-    nb      = np.array(list(voxel_set), dtype=np.int32)
-    world   = nb.astype(np.float64) * float(voxel_size)
+    nb = np.array(list(voxel_set), dtype=np.int32)
+    world = nb.astype(np.float64) * float(voxel_size)
 
-    tree         = cKDTree(pts)
-    dists, _     = tree.query(world, workers=-1)
+    tree = cKDTree(pts)
+    dists, _ = tree.query(world, workers=-1)
 
-    inside_nb    = dists < trunc
-    nb_f         = nb[inside_nb]
-    d_f          = dists[inside_nb]
+    inside_nb = dists < trunc
+    nb_f = nb[inside_nb]
+    d_f = dists[inside_nb]
 
     grid = vdb.FloatGrid(trunc)
     grid.transform = vdb.createLinearTransform(float(voxel_size))
-    grid.gridClass  = vdb.GridClass.LEVEL_SET
+    grid.gridClass = vdb.GridClass.LEVEL_SET
     accessor = grid.getAccessor()
     for i in range(len(nb_f)):
         accessor.setValueOn(
@@ -322,20 +323,22 @@ def _build_kdtree_sdf(pts, ijk_unique, voxel_size, half_width):
 
     return grid
 
-
 def build_level_set_vdb(pcd, vdb_voxel_size, half_width=3, closing_width=1):
     """
     Convert an Open3D PointCloud into an OpenVDB level-set FloatGrid.
 
-    Primary path:  vdb.tools.topologyToLevelSet (signed narrow-band SDF).
+    Primary path: vdb.tools.topologyToLevelSet (signed narrow-band SDF).
     Fallback path: kd-tree narrow-band unsigned SDF (scipy).
 
     Parameters
     ----------
-    pcd            : o3d.geometry.PointCloud
-    vdb_voxel_size : float  VDB voxel edge length in metres
-    half_width     : int    Narrow-band half-width in voxels (default 3)
-    closing_width  : int    Morphological closing width in voxels (default 1)
+    pcd : o3d.geometry.PointCloud
+    vdb_voxel_size : float
+        VDB voxel edge length in metres
+    half_width : int
+        Narrow-band half-width in voxels (default 3)
+    closing_width : int
+        Morphological closing width in voxels (default 1)
     """
     try:
         import pyopenvdb as vdb
@@ -352,13 +355,13 @@ def build_level_set_vdb(pcd, vdb_voxel_size, half_width=3, closing_width=1):
     # Vectorised world -> index mapping (cell-centred rounding).
     # Computed directly from vdb_voxel_size so that index coordinates
     # always match the grid's createLinearTransform(vdb_voxel_size).
-    ijk_arr    = np.floor(pts / float(vdb_voxel_size) + 0.5).astype(np.int32)
+    ijk_arr = np.floor(pts / float(vdb_voxel_size) + 0.5).astype(np.int32)
     ijk_unique = np.unique(ijk_arr, axis=0)
 
     # Seed grid: binary occupancy with LEVEL_SET class and correct transform
     seed = vdb.FloatGrid()
-    seed.transform  = vdb.createLinearTransform(float(vdb_voxel_size))
-    seed.gridClass  = vdb.GridClass.LEVEL_SET
+    seed.transform = vdb.createLinearTransform(float(vdb_voxel_size))
+    seed.gridClass = vdb.GridClass.LEVEL_SET
     accessor = seed.getAccessor()
     for ijk in ijk_unique:
         accessor.setValueOn((int(ijk[0]), int(ijk[1]), int(ijk[2])), 1.0)
@@ -372,10 +375,10 @@ def build_level_set_vdb(pcd, vdb_voxel_size, half_width=3, closing_width=1):
             dilation=0,
             erosion=0,
         )
-        print("  Level set built via topologyToLevelSet (signed SDF).")
+        print("    Level set built via topologyToLevelSet (signed SDF).")
     except (AttributeError, TypeError):
         print(
-            "  Warning: vdb.tools.topologyToLevelSet not available in this "
+            "    Warning: vdb.tools.topologyToLevelSet not available in this "
             "pyopenvdb build; falling back to kd-tree narrow-band SDF."
         )
         grid_ls = _build_kdtree_sdf(pts, ijk_unique, vdb_voxel_size, half_width)
@@ -383,14 +386,13 @@ def build_level_set_vdb(pcd, vdb_voxel_size, half_width=3, closing_width=1):
     grid_ls.name = "Map"
     return grid_ls
 
-
 # ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
 
 def process_bag(args):
     bag_path = Path(args.bagpath)
-    out_dir  = Path(args.outputdir)
+    out_dir = Path(args.outputdir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if not bag_path.exists():
@@ -403,26 +405,21 @@ def process_bag(args):
     topics_to_read = [args.pc_topic]
     if args.odom_topic:
         topics_to_read.append(args.odom_topic)
-    if args.imu_topic:
-        topics_to_read.append(args.imu_topic)
 
     pointclouds = []  # list[(ts, o3d.PointCloud)]
-    odom_data   = {}  # dict[ts -> 4x4]
-    imu_data    = {}  # dict[ts -> 3x3] (optional, kept for compatibility)
+    odom_data = {}    # dict[ts -> 4x4]
 
-    print(f"Reading bag:      {bag_path}")
-    print(f"Output dir:       {out_dir}")
+    print(f"Reading bag: {bag_path}")
+    print(f"Output dir: {out_dir}")
     print(f"PointCloud topic: {args.pc_topic}")
     if args.odom_topic:
-        print(f"Odometry topic:   {args.odom_topic}")
-    if args.imu_topic:
-        print(f"IMU topic:        {args.imu_topic}")
+        print(f"Odometry topic: {args.odom_topic}")
     if args.enable_loop_closure:
-        print(f"Loop closure:     ENABLED (every {args.loop_closure_search_interval} frames)")
+        print(f"Loop closure: ENABLED (every {args.loop_closure_search_interval} frames)")
     else:
-        print("Loop closure:     disabled")
-    print(f"VDB voxel size:   {vdb_voxel_size} m")
-    print(f"VDB half-width:   {args.vdb_half_width} voxels "
+        print("Loop closure: disabled")
+    print(f"VDB voxel size: {vdb_voxel_size} m")
+    print(f"VDB half-width: {args.vdb_half_width} voxels "
           f"(±{args.vdb_half_width * vdb_voxel_size:.3f} m band)")
 
     with AnyReader([bag_path], default_typestore=TYPESTORE) as reader:
@@ -445,15 +442,6 @@ def process_bag(args):
                     if T is not None:
                         odom_data[ts] = T
 
-                elif args.imu_topic and conn.topic == args.imu_topic:
-                    try:
-                        quat = msg.orientation
-                        imu_data[ts] = R.from_quat(
-                            [quat.x, quat.y, quat.z, quat.w]
-                        ).as_matrix()
-                    except Exception:
-                        pass
-
             except Exception:
                 continue
 
@@ -463,10 +451,16 @@ def process_bag(args):
     print(f"Extracted {len(pointclouds)} point clouds")
     if args.odom_topic:
         print(f"Extracted {len(odom_data)} odometry messages")
+        if len(odom_data) == 0:
+            print("Warning: Odometry topic specified but no messages found. "
+                  "Falling back to identity initial guess for all frames.")
 
     # -----------------------------------------------------------------------
     # 1) Pairwise registration + pose graph
     # -----------------------------------------------------------------------
+    odom_ts_sorted = sorted(odom_data.keys()) if args.odom_topic else []
+    odom_max_latency_ns = int(args.odom_max_latency * 1e9)
+
     posegraph = o3d.pipelines.registration.PoseGraph()
 
     current_transform = np.eye(4, dtype=np.float64)
@@ -486,18 +480,21 @@ def process_bag(args):
     if args.enable_loop_closure and (0 % args.loop_closure_search_interval == 0):
         source_fpfh = compute_fpfh_descriptor(source, args.voxel_size)
 
-    accumulated_pcds   = [source]
-    accumulated_fpfhs  = [source_fpfh]
-    accumulated_poses  = [current_transform.copy()]
+    if args.enable_loop_closure:
+        accumulated_pcds = [source]
+        accumulated_fpfhs = [source_fpfh]
+        accumulated_poses = [current_transform.copy()]
 
     previous_odom_T = None
     if args.odom_topic:
-        closest_ts = get_closest_timestamp(pointclouds[0][0], odom_data)
-        if closest_ts is not None:
+        closest_ts = get_closest_timestamp(pointclouds[0][0], odom_ts_sorted)
+        if closest_ts is not None and abs(closest_ts - pointclouds[0][0]) < odom_max_latency_ns:
             previous_odom_T = odom_data[closest_ts]
+        else:
+            previous_odom_T = None
 
     successful_pc_indices = [0]
-    loop_closures_found   = 0
+    loop_closures_found = 0
 
     print("Registering point clouds...")
     for i in tqdm(range(1, len(pointclouds)), desc="Registering"):
@@ -512,12 +509,15 @@ def process_bag(args):
 
         initial_guess = np.eye(4, dtype=np.float64)
         if args.odom_topic:
-            closest_ts = get_closest_timestamp(ts, odom_data)
-            if closest_ts is not None:
+            closest_ts = get_closest_timestamp(ts, odom_ts_sorted)
+            if closest_ts is not None and abs(closest_ts - ts) < odom_max_latency_ns:
                 current_odom_T = odom_data[closest_ts]
                 if previous_odom_T is not None:
                     initial_guess = np.linalg.inv(previous_odom_T) @ current_odom_T
                 previous_odom_T = current_odom_T
+            else:
+                previous_odom_T = None
+                initial_guess = np.eye(4, dtype=np.float64)
 
         try:
             reg = o3d.pipelines.registration.registration_icp(
@@ -553,14 +553,17 @@ def process_bag(args):
             )
         )
 
-        accumulated_pcds.append(target)
-        accumulated_poses.append(current_transform.copy())
+        if args.enable_loop_closure:
+            accumulated_pcds.append(target)
+            accumulated_poses.append(current_transform.copy())
 
         target_fpfh = None
         do_lc = args.enable_loop_closure and (i % args.loop_closure_search_interval == 0)
         if do_lc:
             target_fpfh = compute_fpfh_descriptor(target, args.voxel_size)
-        accumulated_fpfhs.append(target_fpfh)
+            
+        if args.enable_loop_closure:
+            accumulated_fpfhs.append(target_fpfh)
 
         if do_lc:
             lcs = detect_loop_closure(
@@ -575,6 +578,7 @@ def process_bag(args):
                 loop_fitness_thresh=args.loop_closure_fitness_thresh,
                 temporal_window=100,
             )
+
             for cand_idx, lc_T, lc_fit in lcs:
                 lc_info = np.eye(6, dtype=np.float64) * float(max(lc_fit, 1e-6) * 100.0)
                 posegraph.edges.append(
@@ -663,8 +667,8 @@ def process_bag(args):
                 cang = float(np.dot(n, target_n))
                 vx = np.array(
                     [[0.0, -v[2], v[1]],
-                     [v[2],  0.0, -v[0]],
-                     [-v[1], v[0],  0.0]],
+                     [v[2], 0.0, -v[0]],
+                     [-v[1], v[0], 0.0]],
                     dtype=np.float64,
                 )
                 R3 = np.eye(3, dtype=np.float64) + vx + (vx @ vx) * ((1.0 - cang) / (s * s))
@@ -735,7 +739,7 @@ def process_bag(args):
     vdb_path = out_dir / f"{bag_path.stem}_map.vdb"
 
     try:
-        import pyopenvdb  # noqa: F401  early ImportError before the work starts
+        import pyopenvdb  # noqa: F401 early ImportError before the work starts
 
         grid_ls = build_level_set_vdb(
             pcd_clean,
@@ -747,8 +751,8 @@ def process_bag(args):
         import pyopenvdb as vdb
         vdb.write(str(vdb_path), grids=[grid_ls])
         print(f"Saved VDB level-set map: {vdb_path}")
-        print(f"  Active voxels:  {grid_ls.activeVoxelCount():,}")
-        print(f"  Bounding box:   {grid_ls.evalActiveVoxelBoundingBox()}")
+        print(f"  Active voxels: {grid_ls.activeVoxelCount():,}")
+        print(f"  Bounding box: {grid_ls.evalActiveVoxelBoundingBox()}")
 
     except Exception as e:
         print(f"Warning: VDB generation failed: {e}")
@@ -757,7 +761,6 @@ def process_bag(args):
     print("\nDone.")
     print(f"  Point cloud : {ply_path}")
     print(f"  VDB map     : {vdb_path if vdb_path is not None else 'N/A'}")
-
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -768,30 +771,30 @@ def main():
         description="Convert ROS 2 bag files with PointCloud2 data to an OpenVDB level-set map."
     )
 
-    parser.add_argument("bagpath",   help="Path to the ROS 2 bag file.")
+    parser.add_argument("bagpath", help="Path to the ROS 2 bag file.")
     parser.add_argument("outputdir", help="Directory to save output files.")
 
-    parser.add_argument("--pc_topic",   default="points",
+    parser.add_argument("--pc_topic", default="points",
                         help="PointCloud2 topic name.")
     parser.add_argument("--odom_topic", default=None,
                         help="Odometry topic (nav_msgs/Odometry).")
-    parser.add_argument("--imu_topic",  default=None,
-                        help="IMU topic (optional; currently unused in pipeline).")
 
-    parser.add_argument("--voxel_size",         type=float, default=0.05,
+    parser.add_argument("--voxel_size", type=float, default=0.05,
                         help="Voxel size for point-cloud downsampling and cleaning (m). Default: 0.05")
-    parser.add_argument("--icp_dist_thresh",    type=float, default=0.2,
+    parser.add_argument("--icp_dist_thresh", type=float, default=0.2,
                         help="ICP max correspondence distance (m). Default: 0.2")
     parser.add_argument("--icp_fitness_thresh", type=float, default=0.6,
                         help="Minimum ICP fitness to accept a frame (0-1). Default: 0.6")
+    parser.add_argument("--odom_max_latency", type=float, default=0.5,
+                        help="Maximum latency (seconds) to accept an odometry match. Default: 0.5")
 
-    parser.add_argument("--enable_loop_closure",          action="store_true", default=False,
+    parser.add_argument("--enable_loop_closure", action="store_true", default=False,
                         help="Enable loop closure detection.")
-    parser.add_argument("--loop_closure_radius",          type=float, default=10.0,
+    parser.add_argument("--loop_closure_radius", type=float, default=10.0,
                         help="Spatial radius to search for loop closure candidates (m). Default: 10.0")
-    parser.add_argument("--loop_closure_fitness_thresh",  type=float, default=0.3,
+    parser.add_argument("--loop_closure_fitness_thresh", type=float, default=0.3,
                         help="Min ICP fitness to accept a loop closure constraint. Default: 0.3")
-    parser.add_argument("--loop_closure_search_interval", type=int,   default=10,
+    parser.add_argument("--loop_closure_search_interval", type=int, default=10,
                         help="Run loop closure search every N registered frames. Default: 10")
 
     parser.add_argument("--level_floor", action="store_true",
@@ -800,7 +803,7 @@ def main():
     parser.add_argument("--vdb_voxel_size", type=float, default=None,
                         help="VDB grid voxel edge length in metres. "
                              "Defaults to --voxel_size if not set.")
-    parser.add_argument("--vdb_half_width", type=int,   default=3,
+    parser.add_argument("--vdb_half_width", type=int, default=3,
                         help="Narrow-band half-width in voxels. "
                              "Truncation distance = vdb_half_width × vdb_voxel_size. Default: 3")
 
@@ -811,7 +814,5 @@ def main():
     args = parser.parse_args()
     process_bag(args)
 
-
 if __name__ == "__main__":
     main()
-
