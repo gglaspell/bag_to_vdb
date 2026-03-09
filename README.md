@@ -205,6 +205,7 @@ docker run --rm \
 | `--pc_topic` | `points` | `sensor_msgs/PointCloud2` topic name |
 | `--odom_topic` | `None` | Odometry topic (`nav_msgs/Odometry`); improves ICP initial guess |
 | `--imu_topic` | `None` | IMU topic (parsed but currently unused in pipeline) |
+| `--odom_max_latency` | 0.5 s | Staleness cutoff for odom↔pointcloud timestamp matching |
 
 ### Point Cloud Processing
 
